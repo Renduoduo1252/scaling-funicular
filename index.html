@@ -1,0 +1,747 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI 投融资情报</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --panel-soft: #eef4f2;
+        --text: #17211d;
+        --muted: #68756f;
+        --line: #dde4e0;
+        --accent: #176b54;
+        --accent-strong: #0f513f;
+        --accent-soft: #dceee8;
+        --warn: #9a5b00;
+        --shadow: 0 12px 28px rgba(23, 33, 29, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+          sans-serif;
+        line-height: 1.5;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      .app {
+        min-height: 100vh;
+      }
+
+      .topbar {
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.86);
+        backdrop-filter: blur(18px);
+        position: sticky;
+        top: 0;
+        z-index: 5;
+      }
+
+      .topbar-inner {
+        align-items: center;
+        display: flex;
+        gap: 18px;
+        justify-content: space-between;
+        margin: 0 auto;
+        max-width: 1180px;
+        padding: 18px 20px;
+      }
+
+      .brand {
+        min-width: 220px;
+      }
+
+      h1 {
+        font-size: 22px;
+        line-height: 1.2;
+        margin: 0;
+      }
+
+      .subtle {
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 4px;
+      }
+
+      .search {
+        align-items: center;
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        display: flex;
+        flex: 1;
+        max-width: 460px;
+        min-width: 180px;
+        padding: 0 12px;
+      }
+
+      .search svg {
+        color: var(--muted);
+        flex: 0 0 auto;
+      }
+
+      input,
+      select,
+      button {
+        font: inherit;
+      }
+
+      input[type="search"] {
+        background: transparent;
+        border: 0;
+        color: var(--text);
+        height: 42px;
+        min-width: 0;
+        outline: none;
+        padding: 0 0 0 10px;
+        width: 100%;
+      }
+
+      .toolbar {
+        display: flex;
+        gap: 10px;
+      }
+
+      select,
+      .ghost-button {
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        color: var(--text);
+        height: 42px;
+        padding: 0 12px;
+      }
+
+      .ghost-button {
+        align-items: center;
+        cursor: pointer;
+        display: inline-flex;
+        gap: 8px;
+        justify-content: center;
+        text-decoration: none;
+        white-space: nowrap;
+      }
+
+      main {
+        margin: 0 auto;
+        max-width: 1180px;
+        padding: 22px 20px 44px;
+      }
+
+      .summary-grid {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        margin-bottom: 18px;
+      }
+
+      .metric {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px;
+      }
+
+      .metric-label {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .metric-value {
+        font-size: 26px;
+        font-weight: 700;
+        margin-top: 4px;
+      }
+
+      .content {
+        display: grid;
+        gap: 18px;
+        grid-template-columns: 300px minmax(0, 1fr);
+      }
+
+      .side {
+        align-self: start;
+        display: grid;
+        gap: 14px;
+        position: sticky;
+        top: 94px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        padding: 16px;
+      }
+
+      .panel h2 {
+        font-size: 15px;
+        margin: 0 0 12px;
+      }
+
+      .chart {
+        display: grid;
+        gap: 12px;
+      }
+
+      .bar-row {
+        display: grid;
+        gap: 7px;
+      }
+
+      .bar-meta {
+        align-items: center;
+        display: flex;
+        font-size: 13px;
+        gap: 8px;
+        justify-content: space-between;
+      }
+
+      .bar-track {
+        background: #edf1ef;
+        border-radius: 999px;
+        height: 8px;
+        overflow: hidden;
+      }
+
+      .bar-fill {
+        background: var(--accent);
+        border-radius: 999px;
+        height: 100%;
+        min-width: 4px;
+      }
+
+      .filters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .chip {
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: var(--text);
+        cursor: pointer;
+        min-height: 34px;
+        padding: 6px 11px;
+      }
+
+      .chip.active {
+        background: var(--accent-soft);
+        border-color: var(--accent);
+        color: var(--accent-strong);
+        font-weight: 650;
+      }
+
+      .list-head {
+        align-items: center;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        margin-bottom: 12px;
+      }
+
+      .list-title {
+        font-size: 16px;
+        font-weight: 700;
+      }
+
+      .result-count {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .news-list {
+        display: grid;
+        gap: 12px;
+      }
+
+      .news-card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 18px;
+      }
+
+      .news-card:hover {
+        border-color: #b6c6bf;
+      }
+
+      .news-meta {
+        align-items: center;
+        color: var(--muted);
+        display: flex;
+        flex-wrap: wrap;
+        font-size: 13px;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+
+      .dot {
+        background: #c4cec9;
+        border-radius: 50%;
+        height: 4px;
+        width: 4px;
+      }
+
+      .news-title {
+        font-size: 18px;
+        font-weight: 750;
+        line-height: 1.35;
+        margin: 0 0 10px;
+      }
+
+      .news-title a {
+        text-decoration: none;
+      }
+
+      .news-title a:hover {
+        color: var(--accent-strong);
+        text-decoration: underline;
+      }
+
+      .summary {
+        color: #3e4a45;
+        font-size: 14px;
+        margin: 0 0 14px;
+      }
+
+      .tags {
+        align-items: center;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .tag {
+        background: var(--panel-soft);
+        border-radius: 999px;
+        color: #29483d;
+        font-size: 12px;
+        font-weight: 650;
+        padding: 5px 9px;
+      }
+
+      .tag.industry {
+        background: #f3eadc;
+        color: var(--warn);
+      }
+
+      .empty,
+      .error {
+        background: var(--panel);
+        border: 1px dashed #bac5c0;
+        border-radius: 8px;
+        color: var(--muted);
+        padding: 28px;
+        text-align: center;
+      }
+
+      .error {
+        border-color: #d6a4a4;
+        color: #8b2f2f;
+      }
+
+      @media (max-width: 900px) {
+        .topbar-inner {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        .brand {
+          min-width: 0;
+        }
+
+        .search {
+          max-width: none;
+        }
+
+        .toolbar {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+        }
+
+        .summary-grid,
+        .content {
+          grid-template-columns: 1fr;
+        }
+
+        .side {
+          position: static;
+        }
+      }
+
+      @media (max-width: 560px) {
+        main {
+          padding-left: 12px;
+          padding-right: 12px;
+        }
+
+        .topbar-inner {
+          padding-left: 12px;
+          padding-right: 12px;
+        }
+
+        .summary-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .metric,
+        .panel,
+        .news-card {
+          padding: 14px;
+        }
+
+        .news-title {
+          font-size: 16px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="topbar-inner">
+          <div class="brand">
+            <h1>AI 投融资情报</h1>
+            <div class="subtle" id="lastUpdated">正在读取数据</div>
+          </div>
+          <label class="search" aria-label="搜索">
+            <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                fill="none"
+                stroke="currentColor"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="m21 21-4.3-4.3M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z"
+              />
+            </svg>
+            <input id="searchInput" type="search" placeholder="搜索标题、摘要、来源" />
+          </label>
+          <div class="toolbar">
+            <select id="sortSelect" aria-label="排序">
+              <option value="newest">最新优先</option>
+              <option value="oldest">最早优先</option>
+              <option value="source">来源排序</option>
+            </select>
+            <a class="ghost-button" href="data.json" target="_blank" rel="noreferrer">
+              <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Zm0 0v6h6M12 18v-6m-3 3 3 3 3-3"
+                />
+              </svg>
+              JSON
+            </a>
+          </div>
+        </div>
+      </header>
+
+      <main>
+        <section class="summary-grid" aria-label="统计概览">
+          <div class="metric">
+            <div class="metric-label">总记录</div>
+            <div class="metric-value" id="totalCount">0</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">今日新增</div>
+            <div class="metric-value" id="todayCount">0</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">产品方向</div>
+            <div class="metric-value" id="productCount">0</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">新闻来源</div>
+            <div class="metric-value" id="sourceCount">0</div>
+          </div>
+        </section>
+
+        <section class="content">
+          <aside class="side">
+            <div class="panel">
+              <h2>产品方向</h2>
+              <div class="filters" id="productFilters"></div>
+            </div>
+            <div class="panel">
+              <h2>分类分布</h2>
+              <div class="chart" id="productChart"></div>
+            </div>
+            <div class="panel">
+              <h2>新闻来源</h2>
+              <div class="chart" id="sourceChart"></div>
+            </div>
+          </aside>
+
+          <section>
+            <div class="list-head">
+              <div class="list-title">新闻列表</div>
+              <div class="result-count" id="resultCount">0 条结果</div>
+            </div>
+            <div class="news-list" id="newsList"></div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const state = {
+        items: [],
+        query: "",
+        product: "全部",
+        sort: "newest",
+      };
+
+      const els = {
+        lastUpdated: document.querySelector("#lastUpdated"),
+        totalCount: document.querySelector("#totalCount"),
+        todayCount: document.querySelector("#todayCount"),
+        productCount: document.querySelector("#productCount"),
+        sourceCount: document.querySelector("#sourceCount"),
+        productFilters: document.querySelector("#productFilters"),
+        productChart: document.querySelector("#productChart"),
+        sourceChart: document.querySelector("#sourceChart"),
+        newsList: document.querySelector("#newsList"),
+        resultCount: document.querySelector("#resultCount"),
+        searchInput: document.querySelector("#searchInput"),
+        sortSelect: document.querySelector("#sortSelect"),
+      };
+
+      async function init() {
+        try {
+          const response = await fetch(`data.json?ts=${Date.now()}`);
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          const data = await response.json();
+          state.items = Array.isArray(data) ? data : data.items || [];
+          state.items = state.items.map(normalizeItem);
+          render();
+        } catch (error) {
+          els.lastUpdated.textContent = "数据读取失败";
+          els.newsList.innerHTML = `<div class="error">无法读取 data.json：${escapeHtml(error.message)}</div>`;
+        }
+      }
+
+      function normalizeItem(item) {
+        return {
+          id: item.id || item.link || item.title,
+          title: item.title || "未命名新闻",
+          link: item.link || "#",
+          published_at: item.published_at || "",
+          summary: item.summary || "",
+          product: item.product || "未分类",
+          industry: item.industry || "未分类",
+          source: item.source || "未知来源",
+          collected_at: item.collected_at || "",
+        };
+      }
+
+      function render() {
+        const items = [...state.items];
+        const products = countBy(items, "product");
+        const sources = countBy(items, "source");
+        const latest = latestDate(items);
+
+        els.totalCount.textContent = items.length;
+        els.todayCount.textContent = countToday(items);
+        els.productCount.textContent = Object.keys(products).length;
+        els.sourceCount.textContent = Object.keys(sources).length;
+        els.lastUpdated.textContent = latest ? `最近更新 ${formatDateTime(latest)}` : "暂无更新时间";
+
+        renderProductFilters(products);
+        renderChart(els.productChart, products, 8);
+        renderChart(els.sourceChart, sources, 8);
+        renderList();
+      }
+
+      function renderProductFilters(products) {
+        const entries = [["全部", state.items.length], ...sortEntries(products)];
+        els.productFilters.innerHTML = entries
+          .map(([name, count]) => {
+            const active = state.product === name ? " active" : "";
+            return `<button class="chip${active}" type="button" data-product="${escapeAttr(name)}">${escapeHtml(name)} ${count}</button>`;
+          })
+          .join("");
+
+        els.productFilters.querySelectorAll("button").forEach((button) => {
+          button.addEventListener("click", () => {
+            state.product = button.dataset.product;
+            render();
+          });
+        });
+      }
+
+      function renderChart(container, counts, limit) {
+        const entries = sortEntries(counts).slice(0, limit);
+        const max = Math.max(...entries.map((entry) => entry[1]), 1);
+
+        if (!entries.length) {
+          container.innerHTML = `<div class="empty">暂无数据</div>`;
+          return;
+        }
+
+        container.innerHTML = entries
+          .map(([name, count]) => {
+            const width = Math.max((count / max) * 100, 4);
+            return `
+              <div class="bar-row">
+                <div class="bar-meta">
+                  <span>${escapeHtml(name)}</span>
+                  <strong>${count}</strong>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width:${width}%"></div>
+                </div>
+              </div>
+            `;
+          })
+          .join("");
+      }
+
+      function renderList() {
+        let items = state.items.filter((item) => {
+          const query = state.query.trim().toLowerCase();
+          const matchesProduct = state.product === "全部" || item.product === state.product;
+          const haystack = `${item.title} ${item.summary} ${item.source} ${item.product} ${item.industry}`.toLowerCase();
+          return matchesProduct && (!query || haystack.includes(query));
+        });
+
+        items = sortItems(items);
+        els.resultCount.textContent = `${items.length} 条结果`;
+
+        if (!items.length) {
+          els.newsList.innerHTML = `<div class="empty">没有匹配的新闻</div>`;
+          return;
+        }
+
+        els.newsList.innerHTML = items.map(renderCard).join("");
+      }
+
+      function renderCard(item) {
+        const date = item.published_at ? formatDateTime(item.published_at) : "未知时间";
+        const summary = item.summary && item.summary !== item.title ? item.summary : "";
+
+        return `
+          <article class="news-card">
+            <div class="news-meta">
+              <span>${escapeHtml(date)}</span>
+              <span class="dot"></span>
+              <span>${escapeHtml(item.source)}</span>
+            </div>
+            <h3 class="news-title">
+              <a href="${escapeAttr(item.link)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>
+            </h3>
+            ${summary ? `<p class="summary">${escapeHtml(summary)}</p>` : ""}
+            <div class="tags">
+              <span class="tag">${escapeHtml(item.product)}</span>
+              <span class="tag industry">${escapeHtml(item.industry)}</span>
+            </div>
+          </article>
+        `;
+      }
+
+      function sortItems(items) {
+        return items.sort((a, b) => {
+          if (state.sort === "oldest") {
+            return dateValue(a) - dateValue(b);
+          }
+          if (state.sort === "source") {
+            return a.source.localeCompare(b.source, "zh-CN");
+          }
+          return dateValue(b) - dateValue(a);
+        });
+      }
+
+      function dateValue(item) {
+        const value = Date.parse(item.published_at || item.collected_at || "");
+        return Number.isNaN(value) ? 0 : value;
+      }
+
+      function latestDate(items) {
+        const latest = Math.max(...items.map(dateValue), 0);
+        return latest ? new Date(latest).toISOString() : "";
+      }
+
+      function countBy(items, key) {
+        return items.reduce((acc, item) => {
+          const value = item[key] || "未分类";
+          acc[value] = (acc[value] || 0) + 1;
+          return acc;
+        }, {});
+      }
+
+      function sortEntries(counts) {
+        return Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
+      }
+
+      function countToday(items) {
+        const today = new Date().toISOString().slice(0, 10);
+        return items.filter((item) => {
+          const value = item.published_at || item.collected_at || "";
+          return value.slice(0, 10) === today;
+        }).length;
+      }
+
+      function formatDateTime(value) {
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+          return value;
+        }
+        return new Intl.DateTimeFormat("zh-CN", {
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        }).format(date);
+      }
+
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function escapeAttr(value) {
+        return escapeHtml(value).replaceAll("`", "&#096;");
+      }
+
+      els.searchInput.addEventListener("input", (event) => {
+        state.query = event.target.value;
+        renderList();
+      });
+
+      els.sortSelect.addEventListener("change", (event) => {
+        state.sort = event.target.value;
+        renderList();
+      });
+
+      init();
+    </script>
+  </body>
+</html>
