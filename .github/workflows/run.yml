@@ -1,1 +1,459 @@
 
+ 1 +name: Daily AI Investment Bot
+     2 +
+     3 +on:
+     4 +  schedule:
+     5 +    # 08:00 Beijing time is 00:00 UTC.
+     6 +    - cron: "0 0 * * *"
+     7 +  workflow_dispatch:
+     8 +
+     9 +permissions:
+    10 +  contents: write
+    11 +
+    12 +jobs:
+    13 +  run:
+    14 +    runs-on: ubuntu-latest
+    15 +
+    16 +    steps:
+    17 +      - name: Checkout repository
+    18 +        uses: actions/checkout@v4
+    19 +
+    20 +      - name: Set up Python
+    21 +        uses: actions/setup-python@v5
+    22 +        with:
+    23 +          python-version: "3.11"
+    24 +
+    25 +      - name: Run bot
+    26 +        run: python bot.py
+    27 +
+    28 +      - name: Commit data changes
+    29 +        uses: stefanzweifel/git-auto-commit-action@v5
+    30 +        with:
+    31 +          commit_message: "chore: update ai investment data"
+    32 +          file_pattern: data.json
+
+  └ bot.py (+424 -0)
+      1 +#!/usr/bin/env python3
+      2 +"""
+      3 +Daily crawler for China AI startup financing/investment news.
+      4 +
+      5 +The script uses public RSS search feeds, keeps a local JSON datastore, and
+      6 +deduplicates by canonical URL plus title fingerprint. It intentionally uses only
+      7 +the Python standard library so it can run directly in GitHub Actions.
+      8 +"""
+      9 +
+     10 +from __future__ import annotations
+     11 +
+     12 +import hashlib
+     13 +import html
+     14 +import json
+     15 +import random
+     16 +import re
+     17 +import sys
+     18 +import time
+     19 +import traceback
+     20 +import urllib.error
+     21 +import urllib.parse
+     22 +import urllib.request
+     23 +from datetime import datetime, timezone
+     24 +from email.utils import parsedate_to_datetime
+     25 +from pathlib import Path
+     26 +from typing import Any
+     27 +from xml.etree import ElementTree
+     28 +
+     29 +
+     30 +DATA_FILE = Path("data.json")
+     31 +MAX_ITEMS_PER_RUN = 80
+     32 +REQUEST_TIMEOUT = 20
+     33 +REQUEST_DELAY_RANGE = (1.5, 4.5)
+     34 +
+     35 +USER_AGENTS = [
+     36 +    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     37 +    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+     38 +    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 "
+     39 +    "(KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+     40 +    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+     41 +    "(KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+     42 +]
+     43 +
+     44 +QUERY_TERMS = [
+     45 +    "中国 AI 初创公司 融资 投资",
+     46 +    "中国 人工智能 初创 企业 融资",
+     47 +    "AI 创业公司 获 投资 中国",
+     48 +    "大模型 初创公司 融资 中国",
+     49 +    "生成式 AI 公司 融资 中国",
+     50 +    "中国 AI startup funding investment",
+     51 +    "China AI startup raises funding",
+     52 +]
+     53 +
+     54 +POSITIVE_KEYWORDS = [
+     55 +    "ai",
+     56 +    "人工智能",
+     57 +    "大模型",
+     58 +    "生成式",
+     59 +    "智能体",
+     60 +    "agent",
+     61 +    "初创",
+     62 +    "创业",
+     63 +    "融资",
+     64 +    "投资",
+     65 +    "领投",
+     66 +    "跟投",
+     67 +    "天使轮",
+     68 +    "种子轮",
+     69 +    "pre-a",
+     70 +    "a轮",
+     71 +    "b轮",
+     72 +    "c轮",
+     73 +    "完成",
+     74 +    "获投",
+     75 +]
+     76 +
+     77 +INVESTMENT_KEYWORDS = [
+     78 +    "融资",
+     79 +    "投资",
+     80 +    "领投",
+     81 +    "跟投",
+     82 +    "获投",
+     83 +    "筹集",
+     84 +    "raises",
+     85 +    "raised",
+     86 +    "funding",
+     87 +    "investment",
+     88 +    "financing",
+     89 +]
+     90 +
+     91 +CHINA_KEYWORDS = [
+     92 +    "中国",
+     93 +    "北京",
+     94 +    "上海",
+     95 +    "深圳",
+     96 +    "杭州",
+     97 +    "广州",
+     98 +    "成都",
+     99 +    "南京",
+    100 +    "china",
+    101 +    "chinese",
+    102 +]
+    103 +
+    104 +PRODUCT_PATTERNS = [
+    105 +    ("大模型", ["大模型", "llm", "large language model"]),
+    106 +    ("AI Agent", ["智能体", "agent", "ai agent"]),
+    107 +    ("生成式AI应用", ["生成式", "aigc", "文生", "图像生成", "视频生成"]),
+    108 +    ("AI基础设施", ["算力", "芯片", "gpu", "基础设施", "infra", "云"]),
+    109 +    ("企业AI软件", ["企业", "办公", "协同", "crm", "saas", "软件"]),
+    110 +    ("机器人", ["机器人", "具身智能", "embodied", "robot"]),
+    111 +    ("自动驾驶", ["自动驾驶", "智能驾驶", "adas"]),
+    112 +    ("AI医疗产品", ["医疗", "医药", "诊断", "药物"]),
+    113 +    ("AI教育产品", ["教育", "学习", "教培"]),
+    114 +]
+    115 +
+    116 +INDUSTRY_PATTERNS = [
+    117 +    ("人工智能", ["人工智能", "ai", "大模型", "生成式"]),
+    118 +    ("企业服务", ["企业", "saas", "办公", "协同", "crm"]),
+    119 +    ("半导体/算力", ["芯片", "算力", "gpu", "半导体"]),
+    120 +    ("机器人/具身智能", ["机器人", "具身智能", "embodied", "robot"]),
+    121 +    ("汽车/自动驾驶", ["汽车", "自动驾驶", "智能驾驶", "adas"]),
+    122 +    ("医疗健康", ["医疗", "医药", "诊断", "药物", "健康"]),
+    123 +    ("教育科技", ["教育", "学习", "教培"]),
+    124 +    ("金融科技", ["金融", "投研", "风控", "保险"]),
+    125 +    ("内容/媒体", ["内容", "营销", "视频", "图像", "传媒"]),
+    126 +]
+    127 +
+    128 +
+    129 +def main() -> int:
+    130 +    existing_items = load_existing_items(DATA_FILE)
+    131 +    seen_keys = build_seen_keys(existing_items)
+    132 +
+    133 +    print(f"Loaded {len(existing_items)} existing records.")
+    134 +    new_items: list[dict[str, Any]] = []
+    135 +
+    136 +    for feed_url in build_feed_urls():
+    137 +        try:
+    138 +            feed_items = fetch_rss_items(feed_url)
+    139 +        except Exception as exc:
+    140 +            print(f"Fetch failed: {feed_url} ({exc})", file=sys.stderr)
+    141 +            traceback.print_exc()
+    142 +            continue
+    143 +
+    144 +        for item in feed_items:
+    145 +            normalized = normalize_item(item)
+    146 +            if not normalized or not is_relevant(normalized):
+    147 +                continue
+    148 +
+    149 +            item_keys = make_dedupe_keys(normalized)
+    150 +            if item_keys & seen_keys:
+    151 +                continue
+    152 +
+    153 +            normalized["id"] = stable_id(normalized)
+    154 +            normalized["product"] = classify_text(
+    155 +                normalized["title"] + " " + normalized["summary"], PRODUCT_PATTERNS, "AI相关产品"
+    156 +            )
+    157 +            normalized["industry"] = classify_text(
+    158 +                normalized["title"] + " " + normalized["summary"], INDUSTRY_PATTERNS, "人工智能"
+    159 +            )
+    160 +            normalized["collected_at"] = utc_now_iso()
+    161 +
+    162 +            new_items.append(normalized)
+    163 +            seen_keys.update(item_keys)
+    164 +
+    165 +            if len(new_items) >= MAX_ITEMS_PER_RUN:
+    166 +                break
+    167 +
+    168 +        if len(new_items) >= MAX_ITEMS_PER_RUN:
+    169 +            break
+    170 +
+    171 +        sleep_politely()
+    172 +
+    173 +    if new_items:
+    174 +        all_items = sorted(new_items + existing_items, key=sort_key, reverse=True)
+    175 +        save_items(DATA_FILE, all_items)
+    176 +    else:
+    177 +        save_items(DATA_FILE, existing_items)
+    178 +
+    179 +    print(f"Added {len(new_items)} new records. Total: {len(load_existing_items(DATA_FILE))}.")
+    180 +    return 0
+    181 +
+    182 +
+    183 +def build_feed_urls() -> list[str]:
+    184 +    urls = []
+    185 +    for query in QUERY_TERMS:
+    186 +        params = urllib.parse.urlencode(
+    187 +            {
+    188 +                "q": query,
+    189 +                "hl": "zh-CN",
+    190 +                "gl": "CN",
+    191 +                "ceid": "CN:zh-Hans",
+    192 +            }
+    193 +        )
+    194 +        urls.append(f"https://news.google.com/rss/search?{params}")
+    195 +    return urls
+    196 +
+    197 +
+    198 +def fetch_rss_items(url: str) -> list[dict[str, str]]:
+    199 +    body = fetch_url(url)
+    200 +    root = ElementTree.fromstring(body)
+    201 +    items: list[dict[str, str]] = []
+    202 +
+    203 +    for item in root.findall("./channel/item"):
+    204 +        title = get_xml_text(item, "title")
+    205 +        link = get_xml_text(item, "link")
+    206 +        published = get_xml_text(item, "pubDate")
+    207 +        summary = get_xml_text(item, "description")
+    208 +        source = ""
+    209 +        source_node = item.find("source")
+    210 +        if source_node is not None and source_node.text:
+    211 +            source = clean_text(source_node.text)
+    212 +
+    213 +        items.append(
+    214 +            {
+    215 +                "title": title,
+    216 +                "link": link,
+    217 +                "published_at": published,
+    218 +                "summary": summary,
+    219 +                "source": source,
+    220 +            }
+    221 +        )
+    222 +
+    223 +    return items
+    224 +
+    225 +
+    226 +def fetch_url(url: str) -> bytes:
+    227 +    headers = {
+    228 +        "User-Agent": random.choice(USER_AGENTS),
+    229 +        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    230 +        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+    231 +        "Cache-Control": "no-cache",
+    232 +    }
+    233 +    request = urllib.request.Request(url, headers=headers)
+    234 +
+    235 +    last_error: Exception | None = None
+    236 +    for attempt in range(3):
+    237 +        try:
+    238 +            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+    239 +                return response.read()
+    240 +        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+    241 +            last_error = exc
+    242 +            backoff = (2 ** attempt) + random.uniform(0.5, 2.0)
+    243 +            time.sleep(backoff)
+    244 +
+    245 +    raise RuntimeError(f"request failed after retries: {last_error}")
+    246 +
+    247 +
+    248 +def normalize_item(item: dict[str, str]) -> dict[str, Any] | None:
+    249 +    title = clean_text(item.get("title", ""))
+    250 +    link = canonicalize_url(item.get("link", ""))
+    251 +    summary = clean_text(item.get("summary", ""))
+    252 +    published_at = parse_datetime(item.get("published_at", ""))
+    253 +    source = clean_text(item.get("source", ""))
+    254 +
+    255 +    if not title or not link:
+    256 +        return None
+    257 +
+    258 +    return {
+    259 +        "title": title,
+    260 +        "link": link,
+    261 +        "published_at": published_at,
+    262 +        "summary": summary,
+    263 +        "product": "",
+    264 +        "industry": "",
+    265 +        "source": source,
+    266 +    }
+    267 +
+    268 +
+    269 +def is_relevant(item: dict[str, Any]) -> bool:
+    270 +    text = (item["title"] + " " + item["summary"]).lower()
+    271 +    has_ai_context = any(keyword.lower() in text for keyword in POSITIVE_KEYWORDS)
+    272 +    has_investment = any(keyword.lower() in text for keyword in INVESTMENT_KEYWORDS)
+    273 +    has_china_context = any(keyword.lower() in text for keyword in CHINA_KEYWORDS)
+    274 +    return has_ai_context and has_investment and has_china_context
+    275 +
+    276 +
+    277 +def clean_text(value: str) -> str:
+    278 +    value = html.unescape(value or "")
+    279 +    value = re.sub(r"<[^>]+>", " ", value)
+    280 +    value = re.sub(r"\s+", " ", value)
+    281 +    return value.strip()
+    282 +
+    283 +
+    284 +def canonicalize_url(url: str) -> str:
+    285 +    url = html.unescape((url or "").strip())
+    286 +    parsed = urllib.parse.urlparse(url)
+    287 +
+    288 +    if parsed.netloc == "news.google.com" and parsed.path.startswith("/rss/articles/"):
+    289 +        query = urllib.parse.parse_qs(parsed.query)
+    290 +        if "url" in query and query["url"]:
+    291 +            url = query["url"][0]
+    292 +            parsed = urllib.parse.urlparse(url)
+    293 +
+    294 +    query_pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=False)
+    295 +    filtered_query = [
+    296 +        (key, value)
+    297 +        for key, value in query_pairs
+    298 +        if not key.lower().startswith("utm_")
+    299 +        and key.lower()
+    300 +        not in {"from", "spm", "campaign", "source", "ref", "fbclid", "gclid"}
+    301 +    ]
+    302 +
+    303 +    return urllib.parse.urlunparse(
+    304 +        (
+    305 +            parsed.scheme.lower() or "https",
+    306 +            parsed.netloc.lower(),
+    307 +            parsed.path.rstrip("/") or "/",
+    308 +            "",
+    309 +            urllib.parse.urlencode(filtered_query),
+    310 +            "",
+    311 +        )
+    312 +    )
+    313 +
+    314 +    314 +
+    315 +def parse_datetime(value: str) -> str:
+    316 +    value = (value or "").strip()
+    317 +    if not value:
+    318 +        return ""
+    319 +
+    320 +    try:
+    321 +        parsed = parsedate_to_datetime(value)
+    322 +        if parsed.tzinfo is None:
+    323 +            parsed = parsed.replace(tzinfo=timezone.utc)
+    324 +        return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    325 +    except (TypeError, ValueError):
+    326 +        return value
+    327 +
+    328 +
+    329 +def load_existing_items(path: Path) -> list[dict[str, Any]]:
+    330 +    if not path.exists():
+    331 +        return []
+    332 +
+    333 +    try:
+    334 +        raw = json.loads(path.read_text(encoding="utf-8"))
+    335 +    except (json.JSONDecodeError, OSError) as exc:
+    336 +        backup = path.with_suffix(".json.bak")
+    337 +        try:
+    338 +            backup.write_text(path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+    339 +        except OSError:
+    340 +            pass
+    341 +        print(f"Could not parse {path}; old content backed up to {backup}: {exc}", file=sys.stderr)
+    342 +        return []
+    343 +
+    344 +    if isinstance(raw, list):
+    345 +        return [item for item in raw if isinstance(item, dict)]
+    346 +    if isinstance(raw, dict) and isinstance(raw.get("items"), list):
+    347 +        return [item for item in raw["items"] if isinstance(item, dict)]
+    348 +    return []
+    349 +
+    350 +
+    351 +def save_items(path: Path, items: list[dict[str, Any]]) -> None:
+    352 +    tmp_path = path.with_suffix(".json.tmp")
+    353 +    tmp_path.write_text(
+    354 +        json.dumps(items, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
+    355 +        encoding="utf-8",
+    356 +    )
+    357 +    tmp_path.replace(path)
+    358 +
+    359 +
+    360 +def build_seen_keys(items: list[dict[str, Any]]) -> set[str]:
+    361 +    seen: set[str] = set()
+    362 +    for item in items:
+    363 +        seen.update(make_dedupe_keys(item))
+    364 +    return seen
+    365 +
+    366 +
+    367 +def make_dedupe_keys(item: dict[str, Any]) -> set[str]:
+    368 +    keys = set()    368 +    keys = set()    368 +    keys = set()    368 +    keys = set()
+    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get(    369 +    link = canonicalize_url(str(item.get("link", , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , ""))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get(    370 +    title = normalize_for_key(str(item.get("title", , , , , , , , , , , , , , , , ""))))))))))))))))))))))))))))))))))))))))))))))))
+    371 +    371 +
+    372 +    if link:
+    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add(    373 +        keys.add("url:" + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib. + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode( + hashlib.sha256(link.encode("utf-8")).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest())
+    374 +    if title:
+    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add(    375 +        keys.add("title:" + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title. + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode( + hashlib.sha256(title.encode("utf-8")).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest()))).hexdigest())
+    376 +    return keys    376 +    return keys    376 +    return keys    376 +    return keys
+    377 +    377 +    377 +    377 +
+    378 +    378 +    378 +    378 +
+    379 +def normalize_for_key(value: str) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> str:
+    380 +    value = clean_text(value).lower()    380 +    value = clean_text(value).lower()    380 +    value = clean_text(value).lower()    380 +    value = clean_text(value).lower()
+    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r    381 +    value = re.sub(r"[\W_]+", , , , , , , , , , , , , , , , "", value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE), value, flags=re.UNICODE)
+    382 +    return value    382 +    return value    382 +    return value    382 +    return value
+    383 +    383 +    383 +    383 +
+    384 +    384 +    384 +    384 +
+    385 +def stable_id(item: dictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdict[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any]) -> str) -> str) -> str) -> strdictdictdictdict) -> str) -> str) -> str) -> strdictdictdictdict) -> str) -> str) -> str) -> strdictdictdictdict) -> str) -> str) -> str) -> strdictdictdictdict[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any]) -> str) -> str) -> str) -> strdictdictdictdict) -> str) -> str) -> str) -> strdictdictdictdict) -> str) -> str) -> str) -> strdictdictdictdict) -> str) -> str) -> str) -> strdictdictdictdict[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any]) -> str) -> str) -> str) -> strdictdictdictdict) -> str) -> str) -> str) -> strdictdictdictdict) -> str) -> str) -> str) -> strdictdictdictdict) -> str) -> str) -> str) -> strdictdictdictdict[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any]) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str:
+    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get(    386 +    basis = canonicalize_url(str(item.get("link", , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , ""))) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get())) or normalize_for_key(str(item.get("title", , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , ""))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode("utf-8")).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest()[:16:16:16:16    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(:16:16:16:16    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(:16:16:16:16    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(:16:16:16:16    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode(    387 +    return hashlib.sha256(basis.encode("utf-8")).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest())).hexdigest()[:16:16:16:16:16:16:16:16:16:16:16:16:16:16:16:16]
+    388 +    388 +    388 +    388 +
+    389 +    389 +    389 +    389 +
+    390 +def classify_text(    390 +def classify_text(    390 +def classify_text(    390 +def classify_text(    390 +def classify_text(    390 +def classify_text(    390 +def classify_text(    390 +def classify_text(
+    391 +    text: strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstrstrstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,
+    392 +    patterns: listlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlist[tupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletuple[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr]]],,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,listlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlist[tupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletuple[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, list list list  list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr]]],,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,listlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlist[tupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletuple[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr]]],,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,listlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlistlist[tupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletupletuple[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list list[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr]]],,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+    393 +    fallback: strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstrstrstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,strstrstrstr,
+    394 +) -> str:
+    395 +    lowered = text.lower()    395 +    lowered = text.lower()    395 +    lowered = text.lower()    395 +    lowered = text.lower()
+    396 +    for label, keywords in patterns:
+    397 +        if any(keyword.lower() in lowered for keyword in keywords):
+    398 +            return label    398 +            return label    398 +            return label    398 +            return label
+    399 +    return fallback    399 +    return fallback    399 +    return fallback    399 +    return fallback
+    400 +    400 +    400 +    400 +
+    401 +    401 +    401 +    401 +
+    402 +def get_xml_text(node: ElementTree.ElementElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tagElementTree.Element tagElementTree.Element, tag tag: str) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> strstr) -> str:
+    403 +    child = node.find(tag)    403 +    child = node.find(tag)    403 +    child = node.find(tag)    403 +    child = node.find(tag)
+    404 +    if child is None or child.text is None:
+    405 +        return     405 +        return     405 +        return     405 +        return ""
+    406 +    return child.text    406 +    return child.text    406 +    return child.text    406 +    return child.text
+    407 +    407 +    407 +    407 +
+    408 +    408 +    408 +    408 +
+    409 +def sort_key(item: dictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdict[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any]) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> strdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdict) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> strdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdict[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any]) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> strdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdict) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> strdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdict[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any]) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> strdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdict) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> strdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdictdict[strstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstrstr, Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any Any]) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str) -> str:
+    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get(    410 +    published_at = str(item.get("published_at") or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ""))))))))))))))))
+    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get(    411 +    collected_at = str(item.get("collected_at") or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ) or ""))))))))))))))))
+    412 +    return published_at or collected_at    412 +    return published_at or collected_at    412 +    return published_at or collected_at    412 +    return published_at or collected_at
+    413 +    413 +    413 +    413 +
+    414 +    414 +    414 +    414 +
+    415 +def sleep_politely() -> None:
+    416 +    time.sleep(random.uniform(*REQUEST_DELAY_RANGE))    416 +    time.sleep(random.uniform(*REQUEST_DELAY_RANGE))    416 +    time.sleep(random.uniform(*REQUEST_DELAY_RANGE))    416 +    time.sleep(random.uniform(*REQUEST_DELAY_RANGE))
+    417 +    417 +    417 +    417 +
+    418 +    418 +    418 +    418 +
+    419 +def utc_now_iso() -> str:
+    420 +    return datetime.now(timezone.utc).isoformat().replace(    420 +    return datetime.now(timezone.utc).isoformat().replace(    420 +    return datetime.now(timezone.utc).isoformat().replace(    420 +    return datetime.now(timezone.utc).isoformat().replace(    420 +    return datetime.now(timezone.utc).isoformat().replace(    420 +    return datetime.now(timezone.utc).isoformat().replace(    420 +    return datetime.now(timezone.utc).isoformat().replace(    420 +    return datetime.now(timezone.utc).isoformat().replace("+00:00", , "Z"))))))))
+    421 +    421 +
+    422 +    422 +
+    423 +if __name__ == "__main__":
+    424 +    raise SystemExit(main())    424 +    raise SystemExit(main())
