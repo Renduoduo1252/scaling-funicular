@@ -4,8 +4,11 @@ on:
   schedule:
     # 08:00 Beijing time is 00:00 UTC.
     - cron: "0 0 * * *"
-    # 12:00 Beijing time is 04:00 UTC. This gives the scheduled job a second daily chance.
+    # 12:00 Beijing time is 04:00 UTC.
     - cron: "0 4 * * *"
+    # 12:15 Beijing time is 04:15 UTC. GitHub scheduled workflows can be delayed
+    # or dropped around the top of the hour, so this keeps the noon crawl automatic.
+    - cron: "15 4 * * *"
   workflow_dispatch:
 
 permissions:
