@@ -4,6 +4,8 @@ on:
   schedule:
     # 08:00 Beijing time is 00:00 UTC.
     - cron: "0 0 * * *"
+    # 12:00 Beijing time is 04:00 UTC. This gives the scheduled job a second daily chance.
+    - cron: "0 4 * * *"
   workflow_dispatch:
 
 permissions:
